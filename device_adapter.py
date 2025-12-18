@@ -13,6 +13,9 @@ import serial.tools.list_ports
 MAGIC_ADDRESS = 0x01FFFFFE  # 魔术解锁地址
 MAGIC_VALUE = 0xA55A        # 魔术解锁值
 
+# Flash元数据常量
+ROM_OFF_FLASHMETA = 0x00200000
+FLASH_METADATA_SIZE = 0x00200000
 
 class SuperChisDevice:
     """SuperChis设备类 - 线程安全"""
@@ -96,7 +99,9 @@ class SuperChisDevice:
     
     def sram_bank_select(self, bank):
         """选择SRAM Bank"""
-        self.set_sc_mode(sdram=0, sd_enable=0, write_enable=0, sram_bank=bank, ctrl=0xF^(1<<3))
+        # 兼容D卡bank切换
+        self.writeRom(0x800000, bank)
+        return self.set_sc_mode(sdram=0, sd_enable=0, write_enable=0, sram_bank=bank, ctrl=0xF^(1<<3))
     
     def set_flashmapping(self, mapping):
         """设置Flash映射"""
@@ -286,3 +291,25 @@ class SuperChisDevice:
         """验证ROM数据"""
         actual_data = self.readRom(addr_word, len(expected_data))
         return actual_data == expected_data
+    
+    def eraseFlashMetadata(self):
+        """擦除Flash元数据常量区域 - 重置NOR游戏功能"""
+        self.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])
+        # Flash元数据区域起始地址和大小
+        meta_start = ROM_OFF_FLASHMETA  # 0x00200000
+        meta_size = FLASH_METADATA_SIZE  # 0x00200000 (2MB)
+        
+        # 获取CFI信息
+        cfi_info = self.getRomCFI()
+        sector_size = cfi_info['sector_size']
+        
+        # 计算需要擦除的扇区数量
+        sector_count = meta_size // sector_size
+        
+        # 擦除所有元数据区域的扇区
+        for i in range(sector_count):
+            addr_byte = meta_start + i * sector_size
+            addr_word = addr_byte >> 1
+            self.eraseSector(addr_word, sector_size >> 1)
+        
+        return True
