@@ -109,13 +109,12 @@ class SuperChisDevice:
             raise ValueError("Mapping must be a list of 8 integers.")
         
         magic_addr_word = MAGIC_ADDRESS >> 1
-        MAGIC_FLASH_MAP_VALUE = 0xA558
         
         for i in range(8):
-            self.writeRom(magic_addr_word, MAGIC_FLASH_MAP_VALUE)
-            self.writeRom(magic_addr_word, MAGIC_FLASH_MAP_VALUE)
-            self.writeRom(magic_addr_word, mapping[i])
-            self.writeRom(magic_addr_word, mapping[i])
+            self.writeRom(magic_addr_word, MAGIC_VALUE)
+            self.writeRom(magic_addr_word, MAGIC_VALUE)
+            self.writeRom(magic_addr_word, 0x0100|mapping[i])
+            self.writeRom(magic_addr_word, 0x0100|mapping[i])
         
         return True
     
@@ -259,7 +258,7 @@ class SuperChisDevice:
         self.writeRom(0, 0x30)
         
         time.sleep(0.1)
-        while True:
+        for _ in range(100):
             self.writeRom(0x000555, 0x70)
             status = self.readRom(0, 2)
             if struct.unpack("<H", status)[0] & 0x80:

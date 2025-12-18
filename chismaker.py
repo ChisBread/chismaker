@@ -540,22 +540,50 @@ class ProductionWorker(QThread):
             
             self.log_signal.emit(self.device.port_name, f"扇区大小: {sector_size} 字节, Buffer大小: {buffer_size} 字节")
             
-            # 擦除需要的扇区
+            # 擦除需要的扇区 - 需要处理32MB分段
             addr_end = file_size - 1
             sector_count = (addr_end // sector_size) + 1
+            segment_size = 32 * 1024 * 1024
             
             self.log_signal.emit(self.device.port_name, f"擦除 {sector_count} 个扇区...")
             
+            current_segment = 0
             for i in range(sector_count):
+                if not self.running:
+                    self.log_signal.emit(self.device.port_name, "擦除已取消")
+                    self.finished_signal.emit(self.device.port_name, False)
+                    return
+                
                 addr = i * sector_size
-                device_adapter.eraseSector(addr >> 1, sector_size >> 1)
+                
+                # 检查是否需要切换Flash映射
+                new_segment = addr // segment_size
+                if new_segment != current_segment:
+                    current_segment = new_segment
+                    mapping_offset = current_segment * 8
+                    device_adapter.set_flashmapping([
+                        0 + mapping_offset, 1 + mapping_offset, 2 + mapping_offset, 3 + mapping_offset,
+                        4 + mapping_offset, 5 + mapping_offset, 6 + mapping_offset, 7 + mapping_offset
+                    ])
+                    self.log_signal.emit(self.device.port_name, f"切换映射到段 {current_segment} (映射偏移: {mapping_offset})")
+                
+                # 计算当前段内的偏移
+                offset_in_segment = addr % segment_size
+                device_adapter.eraseSector(offset_in_segment >> 1, sector_size >> 1)
+                
                 progress = int((i + 1) / sector_count * 50)
                 self.progress_signal.emit(self.device.port_name, progress)
+                
                 if (i + 1) % 10 == 0 or (i + 1) == sector_count:
                     self.log_signal.emit(self.device.port_name, 
                         f"已擦除 {i + 1}/{sector_count} 扇区")
             
             self.log_signal.emit(self.device.port_name, "擦除完成，开始写入...")
+            
+            # 重新设置写使能模式和映射（擦除后可能需要重新设置）
+            device_adapter.set_sc_mode(sdram=0, sd_enable=0, write_enable=1)
+            device_adapter.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])
+            time.sleep(0.01)
             
             # 写入数据 - 按32MB分段切换映射
             write_chunk_size = 2048
@@ -584,7 +612,10 @@ class ProductionWorker(QThread):
                     chunk += b'\xff' * (write_chunk_size - len(chunk))
                 
                 # 使用字节地址调用programRom（0xf4命令使用字节地址）
-                device_adapter.programRom(offset_in_segment, chunk, buffer_size)
+                result = device_adapter.programRom(offset_in_segment, chunk, buffer_size)
+                if not result:
+                    raise Exception(f"写入失败于地址 0x{written:08X} (段{current_segment}, 偏移0x{offset_in_segment:08X})")
+                
                 written += write_chunk_size
                 
                 # 每写入64KB输出一次日志
