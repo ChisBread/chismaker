@@ -531,8 +531,6 @@ class ProductionWorker(QThread):
             device_adapter.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])
             time.sleep(0.01)
             
-            self.log_signal.emit(self.device.port_name, "开始量产写入...")
-            
             # 获取CFI信息
             cfi_info = device_adapter.getRomCFI()
             sector_size = cfi_info['sector_size']
@@ -540,15 +538,85 @@ class ProductionWorker(QThread):
             
             self.log_signal.emit(self.device.port_name, f"扇区大小: {sector_size} 字节, Buffer大小: {buffer_size} 字节")
             
+            # 检查Flash内容，找到第一个不一致的位置
+            self.log_signal.emit(self.device.port_name, "检查Flash内容...")
+            self.progress_signal.emit(self.device.port_name, 0)
+            segment_size = 32 * 1024 * 1024
+            check_chunk_size = 4096
+            first_diff_addr = None
+            checked = 0
+            current_segment = 0
+            last_progress = 0
+            
+            while checked < file_size and self.running:
+                # 检查是否需要切换Flash映射
+                new_segment = checked // segment_size
+                if new_segment != current_segment:
+                    current_segment = new_segment
+                    mapping_offset = current_segment * 8
+                    device_adapter.set_flashmapping([
+                        0 + mapping_offset, 1 + mapping_offset, 2 + mapping_offset, 3 + mapping_offset,
+                        4 + mapping_offset, 5 + mapping_offset, 6 + mapping_offset, 7 + mapping_offset
+                    ])
+                
+                # 计算当前段内的偏移
+                offset_in_segment = checked % segment_size
+                addr_word = offset_in_segment >> 1
+                
+                # 计算本次检查长度
+                length = min(check_chunk_size, file_size - checked)
+                expected = rom_data[checked:checked + length]
+                
+                # 读取并比较
+                actual = device_adapter.readRom(addr_word, length)
+                if actual != expected:
+                    first_diff_addr = checked
+                    self.log_signal.emit(self.device.port_name, 
+                        f"发现不一致位置: 0x{first_diff_addr:08X} ({first_diff_addr // (1024*1024)}MB)")
+                    break
+                
+                checked += length
+                
+                # 更新进度（每检查0.5MB或1MB输出一次日志）
+                progress = int(checked / file_size * 15)
+                if progress != last_progress:
+                    self.progress_signal.emit(self.device.port_name, progress)
+                    last_progress = progress
+                
+                if checked % (1024 * 1024) == 0:
+                    self.log_signal.emit(self.device.port_name, 
+                        f"已检查 {checked // (1024*1024)}MB / {file_size // (1024*1024)}MB")
+
+            
+            if not self.running:
+                self.log_signal.emit(self.device.port_name, "量产已取消")
+                self.finished_signal.emit(self.device.port_name, False)
+                return
+            
+            # 如果内容完全一致，直接完成
+            if first_diff_addr is None:
+                self.log_signal.emit(self.device.port_name, "Flash内容与ROM文件完全一致，跳过写入 ✓")
+                self.progress_signal.emit(self.device.port_name, 100)
+                self.finished_signal.emit(self.device.port_name, True)
+                return
+            
+            # 计算需要擦除的起始扇区（向下对齐到扇区边界）
+            start_sector = first_diff_addr // sector_size
+            start_addr = start_sector * sector_size
+            
+            self.log_signal.emit(self.device.port_name, 
+                f"从地址 0x{start_addr:08X} 开始擦除写入...")
+            
             # 擦除需要的扇区 - 需要处理32MB分段
             addr_end = file_size - 1
-            sector_count = (addr_end // sector_size) + 1
-            segment_size = 32 * 1024 * 1024
+            total_sector_count = (addr_end // sector_size) + 1
+            sector_count = total_sector_count - start_sector
             
-            self.log_signal.emit(self.device.port_name, f"擦除 {sector_count} 个扇区...")
+            self.log_signal.emit(self.device.port_name, 
+                f"需要擦除 {sector_count} 个扇区 (从扇区 {start_sector}/{total_sector_count})...")
             
             current_segment = 0
-            for i in range(sector_count):
+            for i in range(start_sector, total_sector_count):
                 if not self.running:
                     self.log_signal.emit(self.device.port_name, "擦除已取消")
                     self.finished_signal.emit(self.device.port_name, False)
@@ -571,12 +639,12 @@ class ProductionWorker(QThread):
                 offset_in_segment = addr % segment_size
                 device_adapter.eraseSector(offset_in_segment >> 1, sector_size >> 1)
                 
-                progress = int((i + 1) / sector_count * 50)
+                progress = 15 + int((i - start_sector + 1) / sector_count * 35)
                 self.progress_signal.emit(self.device.port_name, progress)
                 
-                if (i + 1) % 10 == 0 or (i + 1) == sector_count:
+                if ((i - start_sector + 1) % 10 == 0) or ((i - start_sector + 1) == sector_count):
                     self.log_signal.emit(self.device.port_name, 
-                        f"已擦除 {i + 1}/{sector_count} 扇区")
+                        f"已擦除 {i - start_sector + 1}/{sector_count} 扇区")
             
             self.log_signal.emit(self.device.port_name, "擦除完成，开始写入...")
             
@@ -585,10 +653,9 @@ class ProductionWorker(QThread):
             device_adapter.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])
             time.sleep(0.01)
             
-            # 写入数据 - 按32MB分段切换映射
+            # 写入数据 - 从start_addr开始，按32MB分段切换映射
             write_chunk_size = 2048
-            written = 0
-            segment_size = 32 * 1024 * 1024
+            written = start_addr
             current_segment = 0
             
             while written < file_size and self.running:
@@ -623,7 +690,7 @@ class ProductionWorker(QThread):
                     self.log_signal.emit(self.device.port_name, 
                         f"已写入 {written}/{file_size} 字节 ({written*100//file_size}%)")
                 
-                progress = 50 + int(written / file_size * 50)
+                progress = 50 + int((written - start_addr) / (file_size - start_addr) * 40)
                 self.progress_signal.emit(self.device.port_name, progress)
             
             if not self.running:
@@ -633,10 +700,10 @@ class ProductionWorker(QThread):
             
             self.log_signal.emit(self.device.port_name, "写入完成，开始校验...")
             
-            # 校验 - 同样需要处理32MB分段
+            # 校验 - 从start_addr开始，同样需要处理32MB分段
             device_adapter.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])  # 重置映射到开始
             verify_chunk_size = 4096
-            verified = 0
+            verified = start_addr
             current_segment = 0
             
             while verified < file_size and self.running:
@@ -667,6 +734,8 @@ class ProductionWorker(QThread):
                 
                 # 每校验1MB输出一次日志
                 if verified % (1024 * 1024) == 0 or verified >= file_size:
+                    progress = 90 + int((verified - start_addr) / (file_size - start_addr) * 10)
+                    self.progress_signal.emit(self.device.port_name, progress)
                     self.log_signal.emit(self.device.port_name, 
                         f"已校验 {verified // (1024*1024)}MB / {file_size // (1024*1024)}MB")
             
