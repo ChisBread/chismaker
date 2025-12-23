@@ -916,16 +916,32 @@ class MainWindow(QMainWindow):
             del self.devices[port]
         
         # 添加新设备
+        new_device_added = False
         for port in ports:
             if port not in self.devices:
                 self.devices[port] = DeviceInfo(port)
                 self.log_global(f"发现新设备: {port}")
+                new_device_added = True
         
-        # 更新设备表格
-        self.update_device_table()
+        # 当设备列表变化时，需要完全重建表格
+        self.update_device_table(full_rebuild=(len(removed_ports) > 0 or new_device_added))
     
-    def update_device_table(self):
-        """更新设备表格"""
+    def update_device_table(self, full_rebuild=False):
+        """更新设备表格
+        Args:
+            full_rebuild: 是否完全重建表格（包括widget）
+        """
+        # 记录当前进度条的值
+        progress_values = {}
+        if not full_rebuild:
+            for row in range(self.device_table.rowCount()):
+                port_item = self.device_table.item(row, 0)
+                if port_item:
+                    port = port_item.text()
+                    progress_bar = self.device_table.cellWidget(row, 2)
+                    if progress_bar:
+                        progress_values[port] = progress_bar.value()
+        
         self.device_table.setRowCount(len(self.devices))
         
         for row, (port, device) in enumerate(self.devices.items()):
@@ -940,16 +956,17 @@ class MainWindow(QMainWindow):
                 status_item.setBackground(QColor(255, 182, 193))
             self.device_table.setItem(row, 1, status_item)
             
-            # 进度条
-            if self.device_table.cellWidget(row, 2) is None:
+            # 进度条 - 只在必要时重新创建
+            if full_rebuild or self.device_table.cellWidget(row, 2) is None:
                 progress_bar = QProgressBar()
                 progress_bar.setMinimum(0)
                 progress_bar.setMaximum(100)
-                progress_bar.setValue(0)
+                # 恢复之前的进度值
+                progress_bar.setValue(progress_values.get(port, 0))
                 self.device_table.setCellWidget(row, 2, progress_bar)
             
-            # 操作按钮
-            if self.device_table.cellWidget(row, 3) is None:
+            # 操作按钮 - 只在必要时重新创建（每个按钮都绑定到具体的port）
+            if full_rebuild or self.device_table.cellWidget(row, 3) is None:
                 button_widget = QWidget()
                 button_layout = QHBoxLayout(button_widget)
                 button_layout.setContentsMargins(2, 2, 2, 2)
@@ -1039,9 +1056,12 @@ class MainWindow(QMainWindow):
     
     def start_quality_check_all(self):
         """批量质检"""
+        delay = 0
         for port, device in self.devices.items():
             if device.is_connected():
-                self.start_quality_check(port)
+                # 使用QTimer添加随机延迟，避免USB供电不足
+                QTimer.singleShot(int(delay * 1000), lambda p=port: self.start_quality_check(p))
+                delay += random.uniform(0.5, 1.0)  # 每个设备间隔0.5-1秒
     
     def start_production(self, port: str):
         """开始单个设备量产"""
@@ -1075,9 +1095,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请先选择ROM文件")
             return
         
+        delay = 0
         for port, device in self.devices.items():
             if device.is_connected():
-                self.start_production(port)
+                # 使用QTimer添加随机延迟，避免USB供电不足
+                QTimer.singleShot(int(delay * 1000), lambda p=port: self.start_production(p))
+                delay += random.uniform(0.5, 1.0)  # 每个设备间隔0.5-1秒
     
     def start_reset_nor(self, port: str):
         """开始单个设备重置NOR游戏"""
@@ -1210,7 +1233,11 @@ class MainWindow(QMainWindow):
         device = self.devices.get(port)
         if device:
             device.last_operation = message
-            self.update_device_table()
+            # 仅更新文本内容，不重建widget
+            for row in range(self.device_table.rowCount()):
+                if self.device_table.item(row, 0).text() == port:
+                    self.device_table.setItem(row, 4, QTableWidgetItem(message))
+                    break
         
         self.log_global(f"[{port}] {message}")
     
