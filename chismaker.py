@@ -37,9 +37,9 @@ from device_adapter import SuperChisDevice
 class QualityCheckConfig:
     """质检配置"""
     def __init__(self):
+        self.enable_ppb_unlock = True         # Flash PPB解锁
         self.enable_sram_test = False          # SRAM读写检测
         self.enable_flash_erase = False        # Flash擦除查空
-        self.enable_ppb_unlock = True         # Flash PPB解锁
         self.enable_fast_flash = False        # 快速Flash质检（首尾4M+随机8M）
         self.enable_full_sram = True         # 全量SRAM检测（128KB）
         self.enable_ram_flash = False         # Backup Flash检测
@@ -150,7 +150,20 @@ class QualityCheckWorker(QThread):
             current_test = 0
             progress_per_test = 100 / test_count
             
-            # 1. SRAM读写检测（基础）
+            # 1. Flash PPB解锁（在Flash操作之前）
+            if self.config.enable_ppb_unlock and self.running:
+                current_test += 1
+                self.log_signal.emit(self.device.port_name, f"{current_test}/{test_count} Flash PPB解锁...")
+                self.progress_signal.emit(self.device.port_name, int((current_test - 0.5) * progress_per_test))
+                
+                device_adapter.set_sc_mode(sdram=0, sd_enable=0, write_enable=1)
+                device_adapter.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])
+                device_adapter.unlockPPB()
+                
+                self.log_signal.emit(self.device.port_name, "✓ PPB解锁完成")
+                self.progress_signal.emit(self.device.port_name, int(current_test * progress_per_test))
+
+            # 2. SRAM读写检测（基础）
             if self.config.enable_sram_test and self.running:
                 current_test += 1
                 self.log_signal.emit(self.device.port_name, f"{current_test}/{test_count} SRAM基础读写检测...")
@@ -170,7 +183,7 @@ class QualityCheckWorker(QThread):
                 self.log_signal.emit(self.device.port_name, "✓ SRAM基础测试通过")
                 self.progress_signal.emit(self.device.port_name, int(current_test * progress_per_test))
             
-            # 2. 全量SRAM检测（可选）
+            # 3. 全量SRAM检测（可选）
             if self.config.enable_full_sram and self.running:
                 current_test += 1
                 self.log_signal.emit(self.device.port_name, f"{current_test}/{test_count} 全量SRAM检测(128KB)...")
@@ -199,18 +212,6 @@ class QualityCheckWorker(QThread):
                 self.log_signal.emit(self.device.port_name, "✓ SRAM全量测试通过(128KB)")
                 self.progress_signal.emit(self.device.port_name, int(current_test * progress_per_test))
             
-            # 3. Flash PPB解锁（在Flash操作之前）
-            if self.config.enable_ppb_unlock and self.running:
-                current_test += 1
-                self.log_signal.emit(self.device.port_name, f"{current_test}/{test_count} Flash PPB解锁...")
-                self.progress_signal.emit(self.device.port_name, int((current_test - 0.5) * progress_per_test))
-                
-                device_adapter.set_sc_mode(sdram=0, sd_enable=0, write_enable=1)
-                device_adapter.set_flashmapping([0, 1, 2, 3, 4, 5, 6, 7])
-                device_adapter.unlockPPB()
-                
-                self.log_signal.emit(self.device.port_name, "✓ PPB解锁完成")
-                self.progress_signal.emit(self.device.port_name, int(current_test * progress_per_test))
             
             # 4. Flash擦除查空或快速Flash质检
             if (self.config.enable_flash_erase or self.config.enable_fast_flash) and self.running:
@@ -788,6 +789,11 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("质检配置")
         config_layout = QVBoxLayout()
         
+        
+        self.check_ppb = QCheckBox("Flash PPB解锁")
+        self.check_ppb.setChecked(self.quality_config.enable_ppb_unlock)
+        self.check_ppb.stateChanged.connect(self.on_ppb_changed)
+
         self.check_sram_basic = QCheckBox("SRAM基础读写检测")
         self.check_sram_basic.setChecked(self.quality_config.enable_sram_test)
         self.check_sram_basic.stateChanged.connect(self.on_sram_basic_changed)
@@ -804,19 +810,15 @@ class MainWindow(QMainWindow):
         self.check_flash_fast.setChecked(self.quality_config.enable_fast_flash)
         self.check_flash_fast.stateChanged.connect(self.on_flash_fast_changed)
         
-        self.check_ppb = QCheckBox("Flash PPB解锁")
-        self.check_ppb.setChecked(self.quality_config.enable_ppb_unlock)
-        self.check_ppb.stateChanged.connect(self.on_ppb_changed)
-        
         self.check_ram_flash = QCheckBox("Backup Flash检测")
         self.check_ram_flash.setChecked(self.quality_config.enable_ram_flash)
         self.check_ram_flash.stateChanged.connect(self.on_ram_flash_changed)
         
+        config_layout.addWidget(self.check_ppb)
         config_layout.addWidget(self.check_sram_basic)
         config_layout.addWidget(self.check_sram_full)
         config_layout.addWidget(self.check_flash_erase)
         config_layout.addWidget(self.check_flash_fast)
-        config_layout.addWidget(self.check_ppb)
         config_layout.addWidget(self.check_ram_flash)
         config_layout.addStretch()
         
@@ -1337,6 +1339,11 @@ class MainWindow(QMainWindow):
             # 确保线程已经完成
             if worker.isRunning():
                 worker.wait(2000)  # 等待最多2秒
+                if worker.isRunning():
+                    # 如果还在运行，强制停止
+                    worker.stop()
+                    worker.wait(1000)
+            
             # 断开所有信号连接
             try:
                 worker.log_signal.disconnect()
@@ -1345,7 +1352,12 @@ class MainWindow(QMainWindow):
                 worker.finished.disconnect()
             except:
                 pass
-            # 移除引用,让Python GC可以安全地回收
+            
+            # 使用deleteLater安全删除，而不是直接del
+            # 这样Qt会在适当的时机删除对象，避免在线程运行时析构
+            worker.deleteLater()
+            
+            # 从字典中移除引用
             del self.workers[port]
     
     def log_global(self, message: str):
@@ -1358,21 +1370,27 @@ class MainWindow(QMainWindow):
         self.log_global("正在关闭程序...")
         
         # 停止扫描线程
-        if hasattr(self, 'scanner') and self.scanner.isRunning():
-            self.scanner.stop()
-            self.scanner.wait(5000)  # 等待最多5秒
+        if hasattr(self, 'scanner') and self.scanner:
             if self.scanner.isRunning():
-                self.scanner.terminate()
-                self.scanner.wait()
+                self.scanner.stop()
+                self.scanner.wait(3000)
+                if self.scanner.isRunning():
+                    self.scanner.terminate()
+                    self.scanner.wait(1000)
+            self.scanner.deleteLater()
         
         # 停止所有工作线程
         for port, worker in list(self.workers.items()):
             if worker.isRunning():
                 worker.stop()
-                worker.wait(5000)  # 等待最多5秒
+                worker.wait(3000)  # 等待最多3秒
                 if worker.isRunning():
+                    self.log_global(f"强制终止 {port} 的线程")
                     worker.terminate()
-                    worker.wait()
+                    worker.wait(1000)
+            
+            # 使用deleteLater安全删除
+            worker.deleteLater()
         
         # 清空工作线程字典
         self.workers.clear()

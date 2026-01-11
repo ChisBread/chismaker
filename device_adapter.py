@@ -263,7 +263,7 @@ class SuperChisDevice:
             status = self.readRom(0, 2)
             if struct.unpack("<H", status)[0] & 0x80:
                 break
-            time.sleep(0.1)
+            time.sleep(0.01)
         
         self.writeRom(0, 0x90)
         self.writeRom(0, 0x00)
